@@ -5,14 +5,23 @@ Configuration for the Hospital Chatbot AI Agent.
 - Model settings
 """
 
+import os
+from dotenv import load_dotenv
+
+# Load variables from .env file
+load_dotenv()
+
 # ---------------------------------------------------------------------------
 # Groq API Keys – rotated automatically on 429 rate-limit errors
 # ---------------------------------------------------------------------------
+# Dynamically load all keys starting with GROQ_API_KEY_
 GROQ_API_KEYS = [
-    "gsk_your_groq_api_key_1",
-    "gsk_your_groq_api_key_2",
-    # Add more keys here if you want to use the rotation feature
+    val for key, val in os.environ.items() if key.startswith("GROQ_API_KEY_") and val
 ]
+
+# Fallback if no keys found
+if not GROQ_API_KEYS:
+    GROQ_API_KEYS = ["gsk_placeholder"]
 
 # ---------------------------------------------------------------------------
 # Groq Model
@@ -22,9 +31,9 @@ GROQ_MODEL = "llama-3.3-70b-versatile"
 # ---------------------------------------------------------------------------
 # ChromaDB Cloud
 # ---------------------------------------------------------------------------
-CHROMA_API_KEY = "ck-cFbLLBXnFRApkqX9Uzm2wWBgjy9dWju68XheA89QeiT"
-CHROMA_TENANT = "9c758a5a-143c-49b5-871e-b4e4fa1ddc66"
-CHROMA_DATABASE = "hospital_agent"
+CHROMA_API_KEY = os.environ.get("CHROMA_API_KEY", "placeholder")
+CHROMA_TENANT = os.environ.get("CHROMA_TENANT", "placeholder")
+CHROMA_DATABASE = os.environ.get("CHROMA_DATABASE", "placeholder")
 CHROMA_COLLECTION = "medicines"
 
 # ---------------------------------------------------------------------------
