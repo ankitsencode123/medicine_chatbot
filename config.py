@@ -44,7 +44,16 @@ EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 # ---------------------------------------------------------------------------
 # RAG Settings
 # ---------------------------------------------------------------------------
-TOP_K_RESULTS = 3  # number of documents to retrieve
+TOP_K_RESULTS = 5  # max documents after all filtering (safety cap)
+
+# Cross-Encoder reranking (ms-marco outputs raw logits, not 0-1 probabilities)
+CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+CROSS_ENCODER_THRESHOLD = -4.0  # absolute floor: safety net only (blocks extreme mismatches)
+CROSS_ENCODER_SCORE_GAP = 5.0   # drop docs scoring ≥5 points below the best candidate
+
+# RRF fusion thresholds
+RRF_MIN_SCORE_THRESHOLD = 0.02   # absolute floor
+RRF_SCORE_DROP_RATIO = 0.6       # drop docs scoring < 60% of top doc's score
 
 # ---------------------------------------------------------------------------
 # Data paths

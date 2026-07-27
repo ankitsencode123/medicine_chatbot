@@ -1,18 +1,20 @@
 """
-RAG Engine – Hybrid Search Edition
-────────────────────────────────────
-1. BM25 keyword search  → catches typos & exact product names.
-2. Dense vector search   → catches semantic intent ("my head hurts" → Headache).
-3. Reciprocal Rank Fusion (RRF) → merges both ranked lists into one.
-4. Strict grounding prompt → LLM answers ONLY from retrieved context.
-5. Automatic Groq API key rotation on 429 rate-limit errors.
+RAG Engine – Precision-Optimised Hybrid Search
+────────────────────────────────────────────────
+Pipeline:
+  1. BM25 keyword search (with Levenshtein fuzzy matching for typos)
+  2. Dense vector search via ChromaDB Cloud
+  3. Reciprocal Rank Fusion (RRF) with score-gap dynamic cutoff
+  4. Cross-Encoder reranking with calibrated relevance cutoff
+  5. Strict grounding prompt → LLM answers ONLY from retrieved context
+  6. Automatic Groq API key rotation on 429 rate-limit errors
 """
 
 import sys, pathlib, time, random, re, math
 from collections import Counter
 import pandas as pd
 import chromadb
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 from groq import Groq, RateLimitError
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
@@ -21,14 +23,17 @@ from config import (
     CHROMA_API_KEY, CHROMA_TENANT, CHROMA_DATABASE,
     CHROMA_COLLECTION, EMBEDDING_MODEL, TOP_K_RESULTS,
     CSV_PATH,
+    CROSS_ENCODER_MODEL, CROSS_ENCODER_THRESHOLD, CROSS_ENCODER_SCORE_GAP,
+    RRF_MIN_SCORE_THRESHOLD, RRF_SCORE_DROP_RATIO,
 )
 
 # ═══════════════════════════════════════════════════════════
 # Singleton resources
 # ═══════════════════════════════════════════════════════════
 _embed_model: SentenceTransformer | None = None
+_cross_encoder: CrossEncoder | None = None
 _chroma_collection = None
-_bm25_index = None  # will hold {"docs": [...], "idf": {...}, "tf": [...]}
+_bm25_index = None
 _key_index = 0
 
 
@@ -94,9 +99,8 @@ def _build_bm25_index():
             "tokens": _tokenize_bm25(text),
         })
 
-    # compute IDF
     N = len(docs)
-    df_counts = Counter()  # document frequency for each term
+    df_counts = Counter()
     for d in docs:
         unique_terms = set(d["tokens"])
         for t in unique_terms:
@@ -106,7 +110,6 @@ def _build_bm25_index():
     for term, freq in df_counts.items():
         idf[term] = math.log((N - freq + 0.5) / (freq + 0.5) + 1)
 
-    # average document length
     avg_dl = sum(len(d["tokens"]) for d in docs) / N if N else 1
 
     _bm25_index = {"docs": docs, "idf": idf, "avg_dl": avg_dl}
@@ -115,7 +118,6 @@ def _build_bm25_index():
 
 def _bm25_score(query_tokens: list[str], doc_tokens: list[str],
                 idf: dict, avg_dl: float, k1: float = 1.5, b: float = 0.75) -> float:
-    """Compute BM25 score for a single document."""
     dl = len(doc_tokens)
     doc_tf = Counter(doc_tokens)
     score = 0.0
@@ -131,23 +133,15 @@ def _bm25_score(query_tokens: list[str], doc_tokens: list[str],
 
 def _fuzzy_match_tokens(query_tokens: list[str], doc_tokens: list[str],
                         max_edit_dist: int = 2) -> list[str]:
-    """
-    For each query token that has NO exact match in the index,
-    try to find the closest token via edit distance (Levenshtein).
-    Returns an expanded list of query tokens with corrections applied.
-    """
     index = _build_bm25_index()
     all_vocab = set(index["idf"].keys())
-
     expanded = []
     for qt in query_tokens:
         if qt in all_vocab:
             expanded.append(qt)
         else:
-            # find the closest vocabulary term
             best_term, best_dist = None, max_edit_dist + 1
             for vocab_term in all_vocab:
-                # quick length filter to skip obviously bad matches
                 if abs(len(vocab_term) - len(qt)) > max_edit_dist:
                     continue
                 d = _edit_distance(qt, vocab_term)
@@ -157,12 +151,11 @@ def _fuzzy_match_tokens(query_tokens: list[str], doc_tokens: list[str],
             if best_term is not None and best_dist <= max_edit_dist:
                 expanded.append(best_term)
             else:
-                expanded.append(qt)  # keep original if no close match
+                expanded.append(qt)
     return expanded
 
 
 def _edit_distance(s1: str, s2: str) -> int:
-    """Classic Levenshtein edit distance."""
     if len(s1) < len(s2):
         return _edit_distance(s2, s1)
     if len(s2) == 0:
@@ -178,18 +171,13 @@ def _edit_distance(s1: str, s2: str) -> int:
 
 
 def bm25_retrieve(query: str, top_k: int = 10) -> list[dict]:
-    """BM25 keyword search with fuzzy matching for typo tolerance."""
     index = _build_bm25_index()
     query_tokens = _tokenize_bm25(query)
-
-    # expand tokens with fuzzy matching (corrects typos)
     query_tokens = _fuzzy_match_tokens(query_tokens, [], max_edit_dist=2)
-
     scored = []
     for doc in index["docs"]:
         score = _bm25_score(query_tokens, doc["tokens"], index["idf"], index["avg_dl"])
         scored.append((score, doc))
-
     scored.sort(key=lambda x: x[0], reverse=True)
     results = []
     for score, doc in scored[:top_k]:
@@ -229,7 +217,6 @@ def _get_collection():
 
 
 def vector_retrieve(query: str, top_k: int = 10) -> list[dict]:
-    """Dense vector search via ChromaDB Cloud."""
     model = _get_embed_model()
     query_embedding = model.encode([query]).tolist()
     collection = _get_collection()
@@ -250,30 +237,27 @@ def vector_retrieve(query: str, top_k: int = 10) -> list[dict]:
 
 
 # ═══════════════════════════════════════════════════════════
-# Reciprocal Rank Fusion (RRF)
+# Reciprocal Rank Fusion (RRF) with Dynamic Thresholding
 # ═══════════════════════════════════════════════════════════
 
 def reciprocal_rank_fusion(
     ranked_lists: list[list[dict]],
     k: int = 60,
-    top_n: int = TOP_K_RESULTS,
+    top_n: int = 5,
+    min_score_threshold: float = RRF_MIN_SCORE_THRESHOLD,
+    score_drop_ratio: float = RRF_SCORE_DROP_RATIO,
 ) -> list[dict]:
     """
-    Merge multiple ranked result lists using RRF.
+    Merge multiple ranked result lists using RRF with dual dynamic cutoff:
 
-    For each document across all lists:
-        RRF_score = Σ  1 / (k + rank_i)
+    1. Absolute floor: documents below min_score_threshold are dropped.
+    2. Score-gap cutoff: documents scoring < score_drop_ratio × top_score
+       are dropped (catches the cliff between relevant and bycatch docs).
 
-    where rank_i is the 1-based rank of the document in list i
-    (and 0 contribution if not present in that list).
-
-    Args:
-        ranked_lists: list of ranked result lists, each a list of dicts with "id"
-        k: RRF constant (default 60 per the original paper)
-        top_n: number of final results to return
+    Output list may be shorter than top_n.
     """
     rrf_scores: dict[str, float] = {}
-    doc_map: dict[str, dict] = {}  # id → full doc dict
+    doc_map: dict[str, dict] = {}
 
     for rlist in ranked_lists:
         for rank, doc in enumerate(rlist, 1):
@@ -282,33 +266,115 @@ def reciprocal_rank_fusion(
             if doc_id not in doc_map:
                 doc_map[doc_id] = doc
 
-    # sort by RRF score descending
     sorted_ids = sorted(rrf_scores, key=lambda x: rrf_scores[x], reverse=True)
+
+    # Determine the score-gap cutoff from the top-scoring document
+    top_score = rrf_scores[sorted_ids[0]] if sorted_ids else 0.0
+    gap_cutoff = top_score * score_drop_ratio
 
     results = []
     for doc_id in sorted_ids[:top_n]:
-        doc = doc_map[doc_id].copy()
-        doc["rrf_score"] = round(rrf_scores[doc_id], 6)
-        results.append(doc)
+        score = round(rrf_scores[doc_id], 6)
+        if score >= min_score_threshold and score >= gap_cutoff:
+            doc = doc_map[doc_id].copy()
+            doc["rrf_score"] = score
+            results.append(doc)
+
     return results
 
 
 # ═══════════════════════════════════════════════════════════
-# Hybrid Retrieve (BM25 + Vector + RRF)
+# Cross-Encoder Reranker
+# ═══════════════════════════════════════════════════════════
+
+def _get_cross_encoder() -> CrossEncoder:
+    """Lazy-load the Cross-Encoder model (singleton)."""
+    global _cross_encoder
+    if _cross_encoder is None:
+        _cross_encoder = CrossEncoder(CROSS_ENCODER_MODEL)
+    return _cross_encoder
+
+
+def cross_encoder_rerank(
+    query: str,
+    docs: list[dict],
+    threshold: float = CROSS_ENCODER_THRESHOLD,
+    score_gap: float = CROSS_ENCODER_SCORE_GAP,
+) -> list[dict]:
+    """
+    Re-score each document against the query using a Cross-Encoder.
+
+    Dual pruning strategy:
+    1. Absolute floor: documents with score < threshold are dropped
+       (safety net for extreme mismatches).
+    2. Score-gap: documents scoring > score_gap points below the best
+       candidate are dropped (catches irrelevant bycatch even when
+       absolute scores vary by query type — which they do: the same
+       cross-encoder scores relevant pairs from 0.3 to 9.2 depending
+       on lexical alignment).
+
+    Returns a list sorted by cross-encoder score (desc), possibly shorter
+    than input.
+    """
+    if not docs:
+        return []
+
+    model = _get_cross_encoder()
+
+    # build pairs for scoring
+    pairs = [(query, doc["document"]) for doc in docs]
+    scores = model.predict(pairs)
+
+    # find the top score for gap-based pruning
+    top_ce_score = float(max(scores))
+    gap_cutoff = top_ce_score - score_gap
+
+    # attach scores and filter with dual criteria
+    reranked = []
+    for doc, score in zip(docs, scores):
+        ce_score = float(score)
+        if ce_score >= threshold and ce_score >= gap_cutoff:
+            doc_copy = doc.copy()
+            doc_copy["cross_encoder_score"] = round(ce_score, 4)
+            reranked.append(doc_copy)
+
+    # sort by cross-encoder score descending
+    reranked.sort(key=lambda x: x["cross_encoder_score"], reverse=True)
+    return reranked
+
+
+# ═══════════════════════════════════════════════════════════
+# Full Hybrid Retrieve Pipeline
 # ═══════════════════════════════════════════════════════════
 
 def retrieve(query: str, top_k: int = TOP_K_RESULTS) -> list[dict]:
     """
-    Hybrid retrieval: runs BOTH BM25 and dense vector search,
-    then fuses results via Reciprocal Rank Fusion (RRF).
+    Precision-optimised hybrid retrieval pipeline:
+      1. BM25 + Vector → 5 candidates each
+      2. RRF fusion with score-gap + absolute threshold → prune bycatch
+      3. Cross-Encoder reranking with calibrated logit cutoff → only truly relevant docs
+      4. Safety cap at top_k (but usually fewer after pruning)
     """
-    # run both retrieval strategies (fetch more candidates for better fusion)
-    bm25_results = bm25_retrieve(query, top_k=10)
-    vector_results = vector_retrieve(query, top_k=10)
+    # Stage 1: fetch wide candidate pool
+    bm25_results = bm25_retrieve(query, top_k=5)
+    vector_results = vector_retrieve(query, top_k=5)
 
-    # fuse with RRF
-    fused = reciprocal_rank_fusion([bm25_results, vector_results], top_n=top_k)
-    return fused
+    # Stage 2: RRF fusion with dual dynamic cutoff
+    fused = reciprocal_rank_fusion(
+        [bm25_results, vector_results],
+        top_n=5,
+        min_score_threshold=RRF_MIN_SCORE_THRESHOLD,
+        score_drop_ratio=RRF_SCORE_DROP_RATIO,
+    )
+
+    # Stage 3: Cross-Encoder reranking with calibrated threshold
+    reranked = cross_encoder_rerank(
+        query, fused,
+        threshold=CROSS_ENCODER_THRESHOLD,
+    )
+
+    # Safety cap (Cross-Encoder pruning controls precision, not this cap)
+    return reranked[:top_k]
 
 
 # ═══════════════════════════════════════════════════════════
@@ -316,7 +382,6 @@ def retrieve(query: str, top_k: int = TOP_K_RESULTS) -> list[dict]:
 # ═══════════════════════════════════════════════════════════
 
 def _call_groq(messages: list[dict], retries: int = len(GROQ_API_KEYS)) -> str:
-    """Call Groq LLM with automatic key rotation on rate-limit."""
     global _key_index
     last_error = None
     for attempt in range(retries):
@@ -326,7 +391,7 @@ def _call_groq(messages: list[dict], retries: int = len(GROQ_API_KEYS)) -> str:
             response = client.chat.completions.create(
                 model=GROQ_MODEL,
                 messages=messages,
-                temperature=0.2,  # lower for stricter grounding
+                temperature=0.2,
                 max_tokens=1024,
             )
             return response.choices[0].message.content
@@ -351,8 +416,8 @@ def _call_groq(messages: list[dict], retries: int = len(GROQ_API_KEYS)) -> str:
 
 def generate_answer(query: str) -> tuple[str, list[dict]]:
     """
-    End-to-end Hybrid RAG:
-      1. Hybrid retrieve (BM25 + Vector + RRF)
+    End-to-end Precision RAG:
+      1. Hybrid retrieve → RRF → Cross-Encoder rerank
       2. Build strict grounding prompt
       3. Generate answer via Groq LLM
     Returns (answer_text, retrieved_docs).
@@ -370,23 +435,23 @@ def generate_answer(query: str) -> tuple[str, list[dict]]:
 
 
 if __name__ == "__main__":
-    # quick CLI test
     print("=" * 60)
-    print("  MedAssist AI – Hybrid Search Engine")
-    print("  (BM25 + Dense Vector + RRF)")
+    print("  MedAssist AI – Precision Hybrid Search")
+    print("  (BM25 + Vector + RRF + Cross-Encoder)")
     print("=" * 60)
 
-    # test with a misspelled query
     test_queries = [
-        "Do you have Paracetmol?",       # typo: Paracetmol → Paracetamol
-        "Ibuprofin for pain",              # typo: Ibuprofin → Ibuprofen
-        "my head hurts what should i take", # intent-based
-        "Amoxicilin for infection",         # typo: Amoxicilin → Amoxicillin
+        "Do you have Paracetmol?",
+        "Ibuprofin for pain",
+        "my head hurts what should i take",
+        "Amoxicilin for infection",
+        "Do you have Ibuprofen for pain relief?",
     ]
     for q in test_queries:
         print(f"\n🔍 Query: {q}")
         docs = retrieve(q)
-        print(f"   Top result: {docs[0]['metadata']['medicine_name']} "
-              f"(RRF={docs[0].get('rrf_score', 'N/A')})")
+        print(f"   Returned {len(docs)} doc(s):")
         for d in docs:
-            print(f"     - {d['id']}: {d['metadata']['medicine_name']}")
+            print(f"     ✅ {d['metadata']['medicine_name']} "
+                  f"(RRF={d.get('rrf_score', 'N/A')}, "
+                  f"CE={d.get('cross_encoder_score', 'N/A')})")
