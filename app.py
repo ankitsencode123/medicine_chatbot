@@ -242,8 +242,7 @@ with st.sidebar:
     st.markdown("---")
     st.markdown(
         "**LangChain-powered hospital pharmacy agent.**  \n"
-        "Ask about medicines, stock, dosage, and alternatives.\n\n"
-        "🚀 *Streaming enabled — see answers in real-time!*"
+        "Ask about medicines, stock, dosage, and alternatives."
     )
     st.markdown("---")
 
@@ -372,31 +371,23 @@ def process_query(query: str):
     )
 
     try:
-        from agent import run_agent_stream
+        from agent import run_agent
 
-        stream = run_agent_stream(query)
-
-        # First yield is the docs list
-        docs = next(stream)
+        full_answer, docs = run_agent(query)
         sources = [d["metadata"]["medicine_name"] for d in docs] if docs else []
-
-        # Show source chips early
-        if sources:
-            chips = "".join(
-                f'<span class="source-chip">💊 {s}</span>' for s in sources
-            )
-            st.markdown(
-                f'<div style="margin-bottom:0.5rem;">{chips}</div>',
-                unsafe_allow_html=True,
-            )
-
-        # Stream tokens using st.write_stream
-        def token_generator():
-            for token in stream:
-                yield token
-
-        full_answer = st.write_stream(token_generator())
+        
+        # Clear processing indicator
         status_placeholder.empty()
+        
+        # Render the fresh answer immediately in UI
+        st.markdown(
+            f'<div class="bubble-label bot-label">MedAssist AI</div>'
+            f'<div class="bot-bubble">{full_answer}</div>',
+            unsafe_allow_html=True,
+        )
+        if sources:
+            chips = "".join(f'<span class="source-chip">💊 {s}</span>' for s in sources)
+            st.markdown(f'<div style="margin-bottom:1rem;">{chips}</div>', unsafe_allow_html=True)
 
     except Exception as e:
         status_placeholder.empty()
