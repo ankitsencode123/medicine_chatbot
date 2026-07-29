@@ -56,6 +56,13 @@ RRF_MIN_SCORE_THRESHOLD = 0.02   # absolute floor
 RRF_SCORE_DROP_RATIO = 0.6       # drop docs scoring < 60% of top doc's score
 
 # ---------------------------------------------------------------------------
+# LLM Generation Settings
+# ---------------------------------------------------------------------------
+LLM_TEMPERATURE = 0.2
+LLM_MAX_TOKENS = 1024
+STREAMING_ENABLED = True
+
+# ---------------------------------------------------------------------------
 # Data paths
 # ---------------------------------------------------------------------------
 CSV_PATH = "data/medicines.csv"

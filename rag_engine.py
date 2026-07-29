@@ -1,6 +1,6 @@
 """
-RAG Engine – Precision-Optimised Hybrid Search
-────────────────────────────────────────────────
+RAG Engine – Precision-Optimised Hybrid Search (LangChain Edition)
+──────────────────────────────────────────────────────────────────
 Pipeline:
   1. BM25 keyword search (with Levenshtein fuzzy matching for typos)
   2. Dense vector search via ChromaDB Cloud
@@ -8,14 +8,21 @@ Pipeline:
   4. Cross-Encoder reranking with calibrated relevance cutoff
   5. Strict grounding prompt → LLM answers ONLY from retrieved context
   6. Automatic Groq API key rotation on 429 rate-limit errors
+  7. LangChain ChatGroq with SSE streaming support
 """
 
 import sys, pathlib, time, random, re, math
 from collections import Counter
+from queue import Queue
+from threading import Thread
 import pandas as pd
 import chromadb
 from sentence_transformers import SentenceTransformer, CrossEncoder
-from groq import Groq, RateLimitError
+
+# LangChain imports
+from langchain_groq import ChatGroq
+from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.callbacks import BaseCallbackHandler
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from config import (
@@ -25,6 +32,7 @@ from config import (
     CSV_PATH,
     CROSS_ENCODER_MODEL, CROSS_ENCODER_THRESHOLD, CROSS_ENCODER_SCORE_GAP,
     RRF_MIN_SCORE_THRESHOLD, RRF_SCORE_DROP_RATIO,
+    LLM_TEMPERATURE, LLM_MAX_TOKENS, STREAMING_ENABLED,
 )
 
 # ═══════════════════════════════════════════════════════════
@@ -378,66 +386,173 @@ def retrieve(query: str, top_k: int = TOP_K_RESULTS) -> list[dict]:
 
 
 # ═══════════════════════════════════════════════════════════
-# Groq LLM Caller (with key rotation)
+# LangChain ChatGroq LLM (with key rotation + streaming)
 # ═══════════════════════════════════════════════════════════
 
+class _StreamingCallbackHandler(BaseCallbackHandler):
+    """Pushes each token into a Queue for SSE-style streaming."""
+
+    def __init__(self, queue: Queue):
+        self.queue = queue
+
+    def on_llm_new_token(self, token: str, **kwargs) -> None:
+        self.queue.put(token)
+
+    def on_llm_end(self, *args, **kwargs) -> None:
+        self.queue.put(None)          # sentinel → end of stream
+
+    def on_llm_error(self, error: BaseException, **kwargs) -> None:
+        self.queue.put(None)
+
+
+def _get_llm(streaming: bool = False, callbacks=None) -> ChatGroq:
+    """Create a ChatGroq instance with the current API key."""
+    key = GROQ_API_KEYS[_key_index % len(GROQ_API_KEYS)]
+    return ChatGroq(
+        api_key=key,
+        model=GROQ_MODEL,
+        temperature=LLM_TEMPERATURE,
+        max_tokens=LLM_MAX_TOKENS,
+        streaming=streaming,
+        callbacks=callbacks or [],
+    )
+
+
+def _build_messages(query: str, docs: list[dict]):
+    """Build LangChain message list from query + retrieved docs."""
+    context_block = "\n\n".join(f"• {d['document']}" for d in docs)
+    return [
+        SystemMessage(content=SYSTEM_PROMPT.format(context=context_block)),
+        HumanMessage(content=query),
+    ]
+
+
 def _call_groq(messages: list[dict], retries: int = len(GROQ_API_KEYS)) -> str:
+    """
+    Non-streaming LLM call with key rotation.
+    Accepts raw dict messages (for backward compat with rag_metrics.py).
+    """
     global _key_index
     last_error = None
     for attempt in range(retries):
-        key = GROQ_API_KEYS[_key_index % len(GROQ_API_KEYS)]
-        client = Groq(api_key=key)
         try:
-            response = client.chat.completions.create(
-                model=GROQ_MODEL,
-                messages=messages,
-                temperature=0.2,
-                max_tokens=1024,
-            )
-            return response.choices[0].message.content
-        except RateLimitError as e:
-            last_error = e
-            _key_index += 1
-            wait = 1 + random.random()
-            time.sleep(wait)
+            llm = _get_llm(streaming=False)
+            # Convert dict messages to LangChain message objects
+            lc_messages = []
+            for m in messages:
+                if m["role"] == "system":
+                    lc_messages.append(SystemMessage(content=m["content"]))
+                else:
+                    lc_messages.append(HumanMessage(content=m["content"]))
+            response = llm.invoke(lc_messages)
+            return response.content
         except Exception as e:
             last_error = e
             _key_index += 1
-            if attempt < retries - 1:
-                time.sleep(0.5)
+            wait = 1 + random.random() if attempt < retries - 1 else 0
+            if wait:
+                time.sleep(wait)
     raise RuntimeError(
         f"All {retries} Groq API keys exhausted or errored. Last error: {last_error}"
     )
 
 
 # ═══════════════════════════════════════════════════════════
-# End-to-End RAG
+# End-to-End RAG (Non-Streaming – backward compatible)
 # ═══════════════════════════════════════════════════════════
 
 def generate_answer(query: str) -> tuple[str, list[dict]]:
     """
-    End-to-end Precision RAG:
+    End-to-end Precision RAG (non-streaming):
       1. Hybrid retrieve → RRF → Cross-Encoder rerank
       2. Build strict grounding prompt
-      3. Generate answer via Groq LLM
+      3. Generate answer via LangChain ChatGroq
     Returns (answer_text, retrieved_docs).
     """
+    global _key_index
     docs = retrieve(query)
-    context_block = "\n\n".join(
-        f"• {d['document']}" for d in docs
+    messages = _build_messages(query, docs)
+
+    last_error = None
+    for attempt in range(len(GROQ_API_KEYS)):
+        try:
+            llm = _get_llm(streaming=False)
+            response = llm.invoke(messages)
+            return response.content, docs
+        except Exception as e:
+            last_error = e
+            _key_index += 1
+            if attempt < len(GROQ_API_KEYS) - 1:
+                time.sleep(1 + random.random())
+    raise RuntimeError(
+        f"All Groq API keys exhausted. Last error: {last_error}"
     )
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT.format(context=context_block)},
-        {"role": "user", "content": query},
-    ]
-    answer = _call_groq(messages)
-    return answer, docs
+
+
+# ═══════════════════════════════════════════════════════════
+# End-to-End RAG (Streaming – SSE to frontend)
+# ═══════════════════════════════════════════════════════════
+
+def generate_answer_stream(query: str):
+    """
+    SSE-streaming Precision RAG:
+      1. Hybrid retrieve → RRF → Cross-Encoder rerank
+      2. Build strict grounding prompt
+      3. Stream tokens from LangChain ChatGroq
+
+    Yields:
+      - First yield: list[dict] of retrieved docs (for source chips)
+      - Subsequent yields: str tokens as they arrive from the LLM
+    """
+    global _key_index
+    docs = retrieve(query)
+
+    # Yield docs first so the UI can show source chips early
+    yield docs
+
+    if not STREAMING_ENABLED:
+        # Fallback to non-streaming
+        answer, _ = generate_answer(query)
+        yield answer
+        return
+
+    messages = _build_messages(query, docs)
+    token_queue: Queue = Queue()
+    handler = _StreamingCallbackHandler(token_queue)
+
+    def _invoke():
+        global _key_index
+        last_error = None
+        for attempt in range(len(GROQ_API_KEYS)):
+            try:
+                llm = _get_llm(streaming=True, callbacks=[handler])
+                llm.invoke(messages)
+                return
+            except Exception as e:
+                last_error = e
+                _key_index += 1
+                if attempt < len(GROQ_API_KEYS) - 1:
+                    time.sleep(0.5)
+        # Signal error to consumer
+        token_queue.put(None)
+
+    thread = Thread(target=_invoke, daemon=True)
+    thread.start()
+
+    # Yield tokens as they arrive
+    while True:
+        token = token_queue.get()
+        if token is None:
+            break
+        yield token
+
+    thread.join(timeout=5)
 
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("  MedAssist AI – Precision Hybrid Search")
-    print("  (BM25 + Vector + RRF + Cross-Encoder)")
+    print("  MedAssist AI – LangChain Precision Hybrid Search")
+    print("  (BM25 + Vector + RRF + Cross-Encoder + Streaming)")
     print("=" * 60)
 
     test_queries = [
@@ -455,3 +570,4 @@ if __name__ == "__main__":
             print(f"     ✅ {d['metadata']['medicine_name']} "
                   f"(RRF={d.get('rrf_score', 'N/A')}, "
                   f"CE={d.get('cross_encoder_score', 'N/A')})")
+

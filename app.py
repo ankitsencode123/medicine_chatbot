@@ -1,7 +1,9 @@
 """
-Hospital Chatbot – Streamlit UI
-────────────────────────────────
+Hospital Chatbot – Streamlit UI (Streaming Edition)
+────────────────────────────────────────────────────
 Premium dark-themed chat interface for MedAssist AI.
+Uses LangChain agent with SSE-style streaming for
+instant token delivery to the user.
 """
 
 import streamlit as st
@@ -183,6 +185,27 @@ section[data-testid="stSidebar"] .stMarkdown li {
 .typing-dot:nth-child(2) { animation-delay: 0.2s; }
 .typing-dot:nth-child(3) { animation-delay: 0.4s; }
 
+/* ── Streaming indicator ── */
+.streaming-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 0.2rem 0.6rem;
+    border-radius: 12px;
+    font-size: 0.7rem;
+    font-weight: 600;
+    background: rgba(99, 102, 241, 0.15);
+    border: 1px solid rgba(99, 102, 241, 0.3);
+    color: #a5b4fc;
+    margin-bottom: 0.5rem;
+}
+.streaming-dot {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: #6ee7b7;
+    animation: pulse 1s infinite;
+}
+
 /* ── Status badge ── */
 .status-badge {
     display: inline-flex;
@@ -218,8 +241,9 @@ with st.sidebar:
     )
     st.markdown("---")
     st.markdown(
-        "**AI-powered hospital pharmacy assistant.**  \n"
-        "Ask about medicines, stock, dosage, and alternatives."
+        "**LangChain-powered hospital pharmacy agent.**  \n"
+        "Ask about medicines, stock, dosage, and alternatives.\n\n"
+        "🚀 *Streaming enabled — see answers in real-time!*"
     )
     st.markdown("---")
 
@@ -252,9 +276,19 @@ with st.sidebar:
             st.session_state["pending_query"] = clean
 
     st.markdown("---")
+
+    # Agent info
+    st.markdown("### 🤖 Agent Tools")
+    st.markdown(
+        "- 📦 **Stock Check** — availability lookup\n"
+        "- 🔄 **Alternatives** — substitute finder\n"
+        "- 💬 **FAQ / RAG** — general Q&A"
+    )
+    st.markdown("---")
+
     st.markdown(
         "<p style='color:#64748b;font-size:0.75rem;text-align:center;'>"
-        "Powered by Groq · ChromaDB · LangChain<br>"
+        "Powered by LangChain · Groq · ChromaDB<br>"
         "© 2026 MedAssist AI</p>",
         unsafe_allow_html=True,
     )
@@ -265,7 +299,7 @@ with st.sidebar:
 st.markdown(
     '<div class="main-header">'
     '<h1>🏥 MedAssist AI</h1>'
-    '<p>Your intelligent hospital pharmacy assistant — ask about medicines, stock, dosage & alternatives</p>'
+    '<p>Your intelligent hospital pharmacy agent — powered by LangChain with real-time streaming</p>'
     '</div>',
     unsafe_allow_html=True,
 )
@@ -304,10 +338,10 @@ for msg in st.session_state.messages:
 
 
 # ─────────────────────────────────────────────────────────
-# Process query (from chat input or quick action)
+# Process query with streaming
 # ─────────────────────────────────────────────────────────
 def process_query(query: str):
-    """Run RAG pipeline and update chat."""
+    """Run agent pipeline with SSE streaming and update chat."""
     # add user message
     st.session_state.messages.append({"role": "user", "content": query})
     st.markdown(
@@ -316,45 +350,48 @@ def process_query(query: str):
         unsafe_allow_html=True,
     )
 
-    # typing indicator
-    typing_placeholder = st.empty()
-    typing_placeholder.markdown(
-        '<div class="bot-bubble">'
-        '<span class="typing-dot"></span>'
-        '<span class="typing-dot"></span>'
-        '<span class="typing-dot"></span>'
+    # Streaming indicator
+    st.markdown(
+        '<div class="bubble-label bot-label">MedAssist AI</div>'
+        '<div class="streaming-badge">'
+        '<span class="streaming-dot"></span> Streaming response…'
         '</div>',
         unsafe_allow_html=True,
     )
 
     try:
-        from rag_engine import generate_answer
-        answer, docs = generate_answer(query)
-        sources = [d["metadata"]["medicine_name"] for d in docs]
+        from agent import run_agent_stream
+
+        stream = run_agent_stream(query)
+
+        # First yield is the docs list
+        docs = next(stream)
+        sources = [d["metadata"]["medicine_name"] for d in docs] if docs else []
+
+        # Show source chips early
+        if sources:
+            chips = "".join(
+                f'<span class="source-chip">💊 {s}</span>' for s in sources
+            )
+            st.markdown(
+                f'<div style="margin-bottom:0.5rem;">{chips}</div>',
+                unsafe_allow_html=True,
+            )
+
+        # Stream tokens using st.write_stream
+        def token_generator():
+            for token in stream:
+                yield token
+
+        full_answer = st.write_stream(token_generator())
+
     except Exception as e:
-        answer = f"⚠️ Sorry, I encountered an error: {str(e)}"
+        full_answer = f"⚠️ Sorry, I encountered an error: {str(e)}"
         sources = []
+        st.error(full_answer)
 
-    typing_placeholder.empty()
-
-    # render answer
-    # convert markdown bold/italic to HTML for display
-    display_answer = answer.replace("\n", "<br>")
-    st.markdown(
-        f'<div class="bubble-label bot-label">MedAssist AI</div>'
-        f'<div class="bot-bubble">{display_answer}</div>',
-        unsafe_allow_html=True,
-    )
-
-    if sources:
-        chips = "".join(
-            f'<span class="source-chip">💊 {s}</span>' for s in sources
-        )
-        st.markdown(
-            f'<div style="margin-bottom:1rem;">{chips}</div>',
-            unsafe_allow_html=True,
-        )
-
+    # Store the complete answer in chat history
+    display_answer = full_answer.replace("\n", "<br>") if full_answer else ""
     st.session_state.messages.append({
         "role": "assistant",
         "content": display_answer,
@@ -385,6 +422,9 @@ if not st.session_state.messages:
         '<p style="color:#64748b; font-size:0.9rem;">'
         'Type a question below or use the quick queries in the sidebar.<br>'
         'Try: <em>"Do you have Paracetamol 500mg?"</em>'
+        '</p>'
+        '<p style="color:#6ee7b7; font-size:0.8rem; margin-top:0.5rem;">'
+        '⚡ Responses stream in real-time — no more waiting!'
         '</p>'
         '</div>',
         unsafe_allow_html=True,
