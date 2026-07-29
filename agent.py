@@ -18,7 +18,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 from langchain_groq import ChatGroq
 from langchain_core.tools import tool
-from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
 from langchain_core.callbacks import BaseCallbackHandler
 
 from config import (
@@ -158,7 +158,6 @@ def run_agent(query: str) -> tuple[str, list[dict]]:
 
         # Check for tool calls
         if response.tool_calls:
-            from langchain_core.messages import ToolMessage
             for tc in response.tool_calls:
                 tool_map = {t.name: t for t in TOOLS}
                 if tc["name"] in tool_map:
@@ -173,16 +172,19 @@ def run_agent(query: str) -> tuple[str, list[dict]]:
 
 def run_agent_stream(query: str):
     """
-    Run the agent with streaming on the final response.
+    Run the agent and yield results for the UI.
     Yields:
       - First yield: list[dict] of retrieved docs
-      - Subsequent yields: str tokens
+      - Subsequent yields: str tokens (words) from the final answer
+    
+    Since Groq does not support SSE streaming, this simulates
+    token delivery by splitting the completed answer into words.
     """
     global _key_index
     docs = retrieve(query)
     yield docs
 
-    # Run agent non-streaming for tool-calling phase
+    # Run agent with tool-calling (non-streaming)
     llm = _get_agent_llm(streaming=False)
     llm_with_tools = llm.bind_tools(TOOLS)
 
@@ -191,61 +193,32 @@ def run_agent_stream(query: str):
         HumanMessage(content=query),
     ]
 
-    # Tool-calling loop (non-streaming)
-    tool_phase_response = None
+    # Tool-calling loop
+    final_answer = None
     for _ in range(5):
         response = llm_with_tools.invoke(messages)
         messages.append(response)
 
         if response.tool_calls:
-            from langchain_core.messages import ToolMessage
             for tc in response.tool_calls:
                 tool_map = {t.name: t for t in TOOLS}
                 if tc["name"] in tool_map:
                     result = tool_map[tc["name"]].invoke(tc["args"])
                     messages.append(ToolMessage(content=result, tool_call_id=tc["id"]))
         else:
-            tool_phase_response = response
+            final_answer = response.content
             break
 
-    # If tool phase already produced a final answer, stream it token by token
-    if tool_phase_response and not STREAMING_ENABLED:
-        yield tool_phase_response.content
-        return
+    if not final_answer:
+        final_answer = "I wasn't able to process that query. Please try rephrasing."
 
-    if tool_phase_response:
-        # Re-generate the final answer with streaming enabled
-        # Use the tool results context gathered during agent loop
-        token_queue: Queue = Queue()
-        handler = _StreamingCallbackHandler(token_queue)
-
-        # Build a fresh prompt with tool context baked in
-        # Extract tool results from message history
-        context_parts = []
-        for msg in messages:
-            if hasattr(msg, 'content') and isinstance(msg, ToolMessage if 'ToolMessage' in dir() else type(None)):
-                context_parts.append(msg.content)
-
-        # Stream the final answer
-        def _invoke():
-            try:
-                llm_stream = _get_agent_llm(streaming=True, callbacks=[handler])
-                llm_stream.invoke(messages)
-            except Exception:
-                token_queue.put(None)
-
-        thread = Thread(target=_invoke, daemon=True)
-        thread.start()
-
-        while True:
-            token = token_queue.get()
-            if token is None:
-                break
-            yield token
-
-        thread.join(timeout=5)
-    else:
-        yield "I wasn't able to process that query. Please try rephrasing."
+    # Yield answer word-by-word for simulated streaming effect
+    words = final_answer.split(" ")
+    for i, word in enumerate(words):
+        if i < len(words) - 1:
+            yield word + " "
+        else:
+            yield word
 
 
 # ═══════════════════════════════════════════════════════════

@@ -247,11 +247,22 @@ with st.sidebar:
     )
     st.markdown("---")
 
-    # Ingest button
+    # Data Management
     st.markdown("### ⚙️ Data Management")
-    if st.button("🔄 Ingest / Refresh Medicine Data", key="ingest_btn", use_container_width=True):
+    st.markdown("<p style='font-size:0.85rem;color:#e2e8f0;margin-bottom:0.5rem;'>Upload a new dataset (CSV):</p>", unsafe_allow_html=True)
+    uploaded_file = st.file_uploader("", type=["csv"], label_visibility="collapsed")
+    
+    if st.button("🔄 Ingest Medicine Data", key="ingest_btn", use_container_width=True):
         with st.spinner("Ingesting CSV into ChromaDB Cloud …"):
             try:
+                import pathlib
+                from config import CSV_PATH
+                
+                if uploaded_file is not None:
+                    csv_full_path = pathlib.Path(__file__).resolve().parent / CSV_PATH
+                    with open(csv_full_path, "wb") as f:
+                        f.write(uploaded_file.getbuffer())
+                
                 from ingest import ingest
                 count = ingest()
                 st.success(f"✅ {count} medicines ingested!")
@@ -350,11 +361,12 @@ def process_query(query: str):
         unsafe_allow_html=True,
     )
 
-    # Streaming indicator
-    st.markdown(
+    # Processing indicator
+    status_placeholder = st.empty()
+    status_placeholder.markdown(
         '<div class="bubble-label bot-label">MedAssist AI</div>'
         '<div class="streaming-badge">'
-        '<span class="streaming-dot"></span> Streaming response…'
+        '<span class="streaming-dot"></span> Generating response…'
         '</div>',
         unsafe_allow_html=True,
     )
@@ -384,8 +396,10 @@ def process_query(query: str):
                 yield token
 
         full_answer = st.write_stream(token_generator())
+        status_placeholder.empty()
 
     except Exception as e:
+        status_placeholder.empty()
         full_answer = f"⚠️ Sorry, I encountered an error: {str(e)}"
         sources = []
         st.error(full_answer)

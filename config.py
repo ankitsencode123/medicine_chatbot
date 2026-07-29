@@ -60,7 +60,7 @@ RRF_SCORE_DROP_RATIO = 0.6       # drop docs scoring < 60% of top doc's score
 # ---------------------------------------------------------------------------
 LLM_TEMPERATURE = 0.2
 LLM_MAX_TOKENS = 1024
-STREAMING_ENABLED = True
+STREAMING_ENABLED = False  # Groq API does not support SSE streaming
 
 # ---------------------------------------------------------------------------
 # Data paths
